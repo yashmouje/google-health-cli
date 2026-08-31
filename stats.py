@@ -3,11 +3,17 @@
 import subprocess
 import json
 import sys
+import math
 import argparse
 import statistics
 from datetime import date, timedelta
 
 GHEALTH = "./ghealth"
+
+# SpO2 is sampled continuously; a day with only a handful of readings is a
+# partial/incomplete day, not a real measurement. Averaging it alongside full
+# days makes today (or a day you took the band off) look like a health event.
+MIN_SPO2_SAMPLES = 50
 
 # --- ANSI colors ---
 RESET = "\033[0m"
@@ -171,17 +177,19 @@ def collect(start, end):
         "values": [float(r["nonRemHeartRateBeatsPerMinute"]) for r in rows if "nonRemHeartRateBeatsPerMinute" in r],
     }
 
-    rows = ghealth_json("data", "oxygen-saturation", "list", "--from", str(start), "--to", str(end))
+    rows = ghealth_json("data", "oxygen-saturation", "list", "--from", str(start), "--to", str(end), "--limit", "5000")
     by_day = {}
     for r in rows:
         if "percentage" not in r or "time" not in r:
             continue
         by_day.setdefault(r["time"][:10], []).append(r["percentage"])
-    spo2_dates = sorted(by_day)
+    full_days = sorted(d for d in by_day if len(by_day[d]) >= MIN_SPO2_SAMPLES)
+    dropped = sorted(d for d in by_day if len(by_day[d]) < MIN_SPO2_SAMPLES)
     metrics["spo2"] = {
         "label": "Blood Oxygen (SpO2)", "unit": "%", "icon": "🫁",
-        "dates": spo2_dates,
-        "values": [statistics.mean(by_day[d]) for d in spo2_dates],
+        "dates": full_days,
+        "values": [statistics.mean(by_day[d]) for d in full_days],
+        "dropped_days": dropped,
     }
 
     return metrics
@@ -295,6 +303,165 @@ def print_performance(metrics, chrono_age):
           f"  steps and sleep vs. healthy-adult reference points -- not medical advice.{RESET}")
 
 
+def as_dict(m):
+    """metric entry -> {date: value}"""
+    return dict(zip(m["dates"], m["values"]))
+
+
+def weekly_slope(d):
+    """Least-squares slope, expressed per week."""
+    ks = sorted(d)
+    if len(ks) < 6:
+        return None
+    origin = date.fromisoformat(ks[0])
+    x = [(date.fromisoformat(k) - origin).days for k in ks]
+    y = [d[k] for k in ks]
+    mx, my = statistics.mean(x), statistics.mean(y)
+    den = sum((a - mx) ** 2 for a in x)
+    if not den:
+        return None
+    return sum((a - mx) * (b - my) for a, b in zip(x, y)) / den * 7
+
+
+def split_half(d):
+    """Compare first half vs second half with a Welch t-statistic.
+    |t| > 2 is our rough 'clears the noise bar' threshold."""
+    ks = sorted(d)
+    if len(ks) < 8:
+        return None
+    mid = len(ks) // 2
+    a = [d[k] for k in ks[:mid]]
+    b = [d[k] for k in ks[mid:]]
+    if len(a) < 2 or len(b) < 2:
+        return None
+    se = math.sqrt(statistics.variance(a) / len(a) + statistics.variance(b) / len(b))
+    if not se:
+        return None
+    ma, mb = statistics.mean(a), statistics.mean(b)
+    return {"first": ma, "last": mb, "delta": mb - ma, "t": (mb - ma) / se,
+            "n_first": len(a), "n_last": len(b)}
+
+
+def correlate(d1, d2):
+    ks = sorted(set(d1) & set(d2))
+    if len(ks) < 8:
+        return None, 0
+    x = [d1[k] for k in ks]
+    y = [d2[k] for k in ks]
+    mx, my = statistics.mean(x), statistics.mean(y)
+    den = (sum((a - mx) ** 2 for a in x) * sum((b - my) ** 2 for b in y)) ** 0.5
+    if not den:
+        return None, len(ks)
+    return sum((a - mx) * (b - my) for a, b in zip(x, y)) / den, len(ks)
+
+
+def print_trend(metrics):
+    print_header("📈  TREND ANALYSIS", MAGENTA)
+
+    d = {k: as_dict(v) for k, v in metrics.items() if v.get("dates")}
+
+    # --- direction of travel ---
+    print(f"\n  {BOLD}Per-week drift{RESET}")
+    labels = [("steps", "Steps", ""), ("azm", "Active Zone Min", " min"),
+              ("sleep", "Sleep", " h"), ("hrv", "HRV", " ms"),
+              ("resting_hr", "Sleeping RHR", " bpm"), ("heart_rate", "Avg HR", " bpm"),
+              ("spo2", "SpO2", "%")]
+    for key, label, unit in labels:
+        if key not in d:
+            continue
+        s = weekly_slope(d[key])
+        if s is None:
+            continue
+        # For RHR, up is bad; for everything else here, up is good.
+        good_up = key not in ("resting_hr", "heart_rate")
+        color = GREEN if (s > 0) == good_up else RED
+        if abs(s) < 1e-9:
+            color = YELLOW
+        print(f"    {label:<16} {color}{s:+8.2f}{unit}/week{RESET}")
+
+    # --- what clears the noise bar ---
+    print(f"\n  {BOLD}First half vs second half{RESET} {DIM}(|t| > 2 = clears noise){RESET}")
+    shown = 0
+    for key, label, unit in labels:
+        if key not in d:
+            continue
+        r = split_half(d[key])
+        if r is None:
+            continue
+        shown += 1
+        good_up = key not in ("resting_hr", "heart_rate")
+        meaningful = abs(r["t"]) > 2
+        if meaningful:
+            color = GREEN if (r["delta"] > 0) == good_up else RED
+            verdict = "meaningful"
+        else:
+            color = GRAY
+            verdict = "within noise"
+        print(f"    {label:<16} {r['first']:6.1f} → {r['last']:6.1f}{unit}  "
+              f"{color}{r['delta']:+6.1f}{RESET}  {DIM}t={r['t']:+5.2f}{RESET}  {color}{verdict}{RESET}")
+    if not shown:
+        print(f"    {GRAY}need ~8+ days of data{RESET}")
+
+    # --- rolling view ---
+    if "hrv" in d and "resting_hr" in d:
+        ks = sorted(set(d["hrv"]) & set(d["resting_hr"]))
+        if len(ks) >= 10:
+            print(f"\n  {BOLD}7-day rolling recovery markers{RESET}")
+            step = max(1, len(ks) // 12)
+            for i in range(6, len(ks), step):
+                w = ks[i - 6:i + 1]
+                hrv_avg = statistics.mean([d["hrv"][k] for k in w])
+                rhr_avg = statistics.mean([d["resting_hr"][k] for k in w])
+                bar = "█" * int(round(hrv_avg / 4))
+                print(f"    {w[-1]}  hrv {hrv_avg:5.1f}ms  rhr {rhr_avg:5.1f}bpm  {CYAN}{bar}{RESET}")
+
+    # --- correlations ---
+    print(f"\n  {BOLD}Correlations{RESET} {DIM}(|r| < 0.3 is effectively nothing){RESET}")
+    pairs = [("sleep", "hrv", "Sleep → HRV"),
+             ("sleep", "resting_hr", "Sleep → RHR"),
+             ("steps", "hrv", "Steps → HRV"),
+             ("azm", "hrv", "Strain → HRV"),
+             ("steps", "sleep", "Steps → Sleep"),
+             ("azm", "sleep", "Strain → Sleep")]
+    shown = 0
+    for a, b, label in pairs:
+        if a not in d or b not in d:
+            continue
+        r, n = correlate(d[a], d[b])
+        if r is None:
+            continue
+        shown += 1
+        color = CYAN if abs(r) >= 0.3 else GRAY
+        print(f"    {label:<16} {color}r = {r:+.2f}{RESET}  {DIM}(n={n}){RESET}")
+    if not shown:
+        print(f"    {GRAY}need ~8+ days of data{RESET}")
+
+    # --- consistency ---
+    print(f"\n  {BOLD}Consistency{RESET}")
+    if "sleep" in d:
+        v = list(d["sleep"].values())
+        short = sum(1 for x in v if x < 6)
+        good = sum(1 for x in v if x >= 8)
+        print(f"    Nights < 6h      {RED if short/len(v) > 0.2 else GREEN}{short}/{len(v)}{RESET} "
+              f"{DIM}({short/len(v)*100:.0f}%){RESET}")
+        print(f"    Nights ≥ 8h      {GREEN if good/len(v) > 0.3 else YELLOW}{good}/{len(v)}{RESET} "
+              f"{DIM}({good/len(v)*100:.0f}%){RESET}")
+    if "steps" in d:
+        v = list(d["steps"].values())
+        low = sum(1 for x in v if x < 5000)
+        high = sum(1 for x in v if x >= 10000)
+        print(f"    Days < 5k steps  {RED if low/len(v) > 0.3 else YELLOW}{low}/{len(v)}{RESET} "
+              f"{DIM}({low/len(v)*100:.0f}%){RESET}")
+        print(f"    Days ≥ 10k steps {GREEN if high/len(v) > 0.3 else YELLOW}{high}/{len(v)}{RESET} "
+              f"{DIM}({high/len(v)*100:.0f}%){RESET}")
+
+    dropped = metrics.get("spo2", {}).get("dropped_days", [])
+    if dropped:
+        print(f"\n{DIM}  Note: excluded {len(dropped)} partial SpO2 day(s) with <{MIN_SPO2_SAMPLES} "
+              f"readings ({', '.join(dropped[-3:])}){RESET}")
+    print(f"{DIM}  Trends are descriptive statistics on a short window, not a diagnosis.{RESET}")
+
+
 def print_glance(metrics):
     print(f"{BOLD}{MAGENTA}┌{'─'*66}┐{RESET}")
     print(f"{BOLD}{MAGENTA}│{RESET} {BOLD}AT A GLANCE{RESET}{' '*53}{BOLD}{MAGENTA}│{RESET}")
@@ -326,6 +493,8 @@ def _strip_ansi(s):
 def main():
     parser = argparse.ArgumentParser(description="Fitbit Air stats + terminal graphs via ghealth")
     parser.add_argument("--days", type=int, default=14, help="Days of history to pull (default 14)")
+    parser.add_argument("--trend", action="store_true",
+                        help="Run trend analysis (drift, significance, correlations) instead of graphs")
     args = parser.parse_args()
 
     end = date.today()
@@ -340,11 +509,14 @@ def main():
     print_glance(graphable)
     print_performance(metrics, chrono_age)
 
-    colors = [CYAN, MAGENTA, GREEN, YELLOW, "\033[95m", "\033[94m"]
-    for (key, m), color in zip(graphable.items(), colors):
-        print_header(f"{m['icon']}  {m['label']}", color)
-        print_stats(m["values"], m["unit"])
-        plot(m["dates"], m["values"], f"{m['label']} / day", m["unit"])
+    if args.trend:
+        print_trend(metrics)
+    else:
+        colors = [CYAN, MAGENTA, GREEN, YELLOW, "\033[95m", "\033[94m"]
+        for (key, m), color in zip(graphable.items(), colors):
+            print_header(f"{m['icon']}  {m['label']}", color)
+            print_stats(m["values"], m["unit"])
+            plot(m["dates"], m["values"], f"{m['label']} / day", m["unit"])
 
     print()
 
