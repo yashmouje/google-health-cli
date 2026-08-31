@@ -108,6 +108,21 @@ def plot(dates, values, title, unit=""):
     plt.show()
 
 
+def fetch_age():
+    result = subprocess.run([GHEALTH, "user", "profile", "get"], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    try:
+        d = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return d.get("age")
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
 def collect(start, end):
     metrics = {}
 
@@ -143,8 +158,141 @@ def collect(start, end):
         dates.append(r["date"])
         values.append(float(total))
     metrics["azm"] = {"label": "Active Zone Minutes", "unit": " min", "icon": "⚡", "dates": dates, "values": values}
+    metrics["azm"]["raw_rows"] = rows
+
+    rows = series(ghealth_json("data", "daily-heart-rate-variability", "list", "--from", str(start), "--to", str(end)))
+    metrics["hrv"] = {
+        "label": "Heart Rate Variability", "unit": " ms", "icon": "〰",
+        "dates": [r["date"] for r in rows if "averageHeartRateVariabilityMilliseconds" in r],
+        "values": [float(r["averageHeartRateVariabilityMilliseconds"]) for r in rows if "averageHeartRateVariabilityMilliseconds" in r],
+    }
+    metrics["resting_hr"] = {
+        "dates": [r["date"] for r in rows if "nonRemHeartRateBeatsPerMinute" in r],
+        "values": [float(r["nonRemHeartRateBeatsPerMinute"]) for r in rows if "nonRemHeartRateBeatsPerMinute" in r],
+    }
+
+    rows = ghealth_json("data", "oxygen-saturation", "list", "--from", str(start), "--to", str(end))
+    by_day = {}
+    for r in rows:
+        if "percentage" not in r or "time" not in r:
+            continue
+        by_day.setdefault(r["time"][:10], []).append(r["percentage"])
+    spo2_dates = sorted(by_day)
+    metrics["spo2"] = {
+        "label": "Blood Oxygen (SpO2)", "unit": "%", "icon": "🫁",
+        "dates": spo2_dates,
+        "values": [statistics.mean(by_day[d]) for d in spo2_dates],
+    }
 
     return metrics
+
+
+def compute_recovery(metrics):
+    """WHOOP-style recovery %: blends HRV vs personal baseline, resting HR vs
+    baseline, and last night's sleep. Directional, not a medical score."""
+    hrv_vals = metrics["hrv"]["values"]
+    rhr_vals = metrics["resting_hr"]["values"]
+    sleep_vals = metrics["sleep"]["values"]
+    if len(hrv_vals) < 2 or len(rhr_vals) < 2 or not sleep_vals:
+        return None
+
+    baseline_hrv = statistics.mean(hrv_vals[:-1])
+    baseline_rhr = statistics.mean(rhr_vals[:-1])
+    today_hrv, today_rhr = hrv_vals[-1], rhr_vals[-1]
+    last_sleep = sleep_vals[-1]
+
+    hrv_score = clamp(50 + (today_hrv / baseline_hrv - 1) * 100, 0, 100) if baseline_hrv else 50
+    rhr_score = clamp(50 + (baseline_rhr / today_rhr - 1) * 100, 0, 100) if today_rhr else 50
+    sleep_score = clamp(last_sleep / 8 * 100, 0, 100)
+
+    recovery = round(0.5 * hrv_score + 0.3 * rhr_score + 0.2 * sleep_score)
+    return clamp(recovery, 0, 100)
+
+
+def compute_strain(azm_raw_rows):
+    """WHOOP-style 0-21 strain, from the most recent day's heart-rate-zone
+    minutes (peak weighted heaviest, an exponential scale so strain climbs
+    fast early and flattens out at higher load, like WHOOP's)."""
+    rows = [r for r in azm_raw_rows if "date" in r]
+    if not rows:
+        return None
+    rows = sorted(rows, key=lambda r: r["date"])
+    last = rows[-1]
+    load = (int(last.get("sumInFatBurnHeartZone", 0)) * 1
+            + int(last.get("sumInCardioHeartZone", 0)) * 2
+            + int(last.get("sumInPeakHeartZone", 0)) * 3)
+    strain = 21 * (1 - pow(2.71828, -load / 60))
+    return round(clamp(strain, 0, 21), 1)
+
+
+def compute_fitness_age(chrono_age, metrics):
+    """A fun, directional 'fitness age' -- NOT a medical or clinical
+    measurement. Nudges your real age up/down based on how your resting HR,
+    HRV, daily steps, and sleep compare to healthy-adult reference points."""
+    if chrono_age is None:
+        return None
+
+    rhr_vals = metrics["resting_hr"]["values"]
+    hrv_vals = metrics["hrv"]["values"]
+    steps_vals = metrics["steps"]["values"]
+    sleep_vals = metrics["sleep"]["values"]
+    if not (rhr_vals and hrv_vals and steps_vals and sleep_vals):
+        return None
+
+    avg_rhr = statistics.mean(rhr_vals)
+    avg_hrv = statistics.mean(hrv_vals)
+    avg_steps = statistics.mean(steps_vals)
+    avg_sleep = statistics.mean(sleep_vals)
+
+    rhr_adj = (avg_rhr - 60) / 5        # reference: 60 bpm resting HR
+    hrv_adj = (45 - avg_hrv) / 5        # reference: 45ms RMSSD
+    activity_adj = (9000 - avg_steps) / 2000   # reference: 9k steps/day
+    sleep_adj = max(0.0, 7.5 - avg_sleep)      # reference: 7.5h/night
+
+    delta = (rhr_adj + hrv_adj + activity_adj + sleep_adj) / 2
+    fitness_age = clamp(chrono_age + delta, chrono_age - 15, chrono_age + 25)
+    return round(fitness_age, 1)
+
+
+def score_color(pct, good_high=True):
+    if pct is None:
+        return GRAY
+    if good_high:
+        return GREEN if pct >= 67 else YELLOW if pct >= 34 else RED
+    return GREEN if pct <= 34 else YELLOW if pct <= 67 else RED
+
+
+def print_performance(metrics, chrono_age):
+    recovery = compute_recovery(metrics)
+    strain = compute_strain(metrics["azm"].get("raw_rows", []))
+    sleep_vals = metrics["sleep"]["values"]
+    sleep_perf = round(clamp(sleep_vals[-1] / 8 * 100, 0, 150)) if sleep_vals else None
+    fitness_age = compute_fitness_age(chrono_age, metrics)
+
+    print(f"\n{BOLD}{GREEN}┌{'─'*66}┐{RESET}")
+    print(f"{BOLD}{GREEN}│{RESET} {BOLD}PERFORMANCE{RESET}{' '*53}{BOLD}{GREEN}│{RESET}")
+    print(f"{BOLD}{GREEN}├{'─'*66}┤{RESET}")
+
+    def row(icon, label, value_str, color):
+        line = f"{icon}  {label:<20} {color}{BOLD}{value_str}{RESET}"
+        pad = 66 - len(_strip_ansi(line)) - 1
+        print(f"{BOLD}{GREEN}│{RESET} {line}{' '*max(pad,0)}{BOLD}{GREEN}│{RESET}")
+
+    row("🔋", "Recovery", f"{recovery}%" if recovery is not None else "not enough data", score_color(recovery))
+    row("🔥", "Strain (last day)", f"{strain} / 21" if strain is not None else "not enough data",
+        score_color((strain / 21 * 100) if strain is not None else None))
+    row("😴", "Sleep Performance", f"{sleep_perf}%" if sleep_perf is not None else "not enough data", score_color(sleep_perf))
+    if fitness_age is not None:
+        delta = fitness_age - chrono_age
+        delta_str = f"{'+' if delta >= 0 else ''}{delta:.1f}y vs actual {chrono_age}"
+        age_color = GREEN if delta < -1 else RED if delta > 1 else YELLOW
+        row("🧬", "Fitness Age", f"{fitness_age}  {DIM}({delta_str}){RESET}", age_color)
+    else:
+        row("🧬", "Fitness Age", "not enough data", GRAY)
+
+    print(f"{BOLD}{GREEN}└{'─'*66}┘{RESET}")
+    print(f"{DIM}  Fitness Age is a directional, for-fun estimate from your RHR, HRV,\n"
+          f"  steps and sleep vs. healthy-adult reference points -- not medical advice.{RESET}")
 
 
 def print_glance(metrics):
@@ -186,10 +334,14 @@ def main():
     print(f"\n{BOLD}{CYAN}Fitbit Air{RESET}  {DIM}last {args.days} days ({start} to {end}){RESET}\n")
 
     metrics = collect(start, end)
-    print_glance(metrics)
+    chrono_age = fetch_age()
 
-    colors = [CYAN, MAGENTA, GREEN, YELLOW]
-    for (key, m), color in zip(metrics.items(), colors):
+    graphable = {k: v for k, v in metrics.items() if k != "resting_hr"}
+    print_glance(graphable)
+    print_performance(metrics, chrono_age)
+
+    colors = [CYAN, MAGENTA, GREEN, YELLOW, "\033[95m", "\033[94m"]
+    for (key, m), color in zip(graphable.items(), colors):
         print_header(f"{m['icon']}  {m['label']}", color)
         print_stats(m["values"], m["unit"])
         plot(m["dates"], m["values"], f"{m['label']} / day", m["unit"])
