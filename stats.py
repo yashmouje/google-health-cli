@@ -39,6 +39,18 @@ def series(rows, date_key="date"):
     return sorted(rows, key=lambda r: r.get(date_key, ""))
 
 
+def daily_rollup_chunked(data_type, start, end, chunk_days=14):
+    """Some rollup endpoints (e.g. heart-rate) cap the range per request.
+    Pull in <=chunk_days windows and merge."""
+    rows = []
+    cursor = start
+    while cursor <= end:
+        chunk_end = min(cursor + timedelta(days=chunk_days - 1), end)
+        rows.extend(ghealth_json("data", data_type, "daily-rollup", "--from", str(cursor), "--to", str(chunk_end)))
+        cursor = chunk_end + timedelta(days=1)
+    return rows
+
+
 def trend_pct(values):
     if len(values) < 4:
         return None
@@ -113,7 +125,7 @@ def collect(start, end):
         "values": [r["minutesAsleep"] / 60.0 for r in rows if "minutesAsleep" in r],
     }
 
-    rows = series(ghealth_json("data", "heart-rate", "daily-rollup", "--from", str(start), "--to", str(end)))
+    rows = series(daily_rollup_chunked("heart-rate", start, end))
     metrics["heart_rate"] = {
         "label": "Heart Rate", "unit": " bpm", "icon": "❤",
         "dates": [r["date"] for r in rows if "beatsPerMinuteAvg" in r],
