@@ -26,7 +26,8 @@ The scores are rough approximations for fun. They aren't WHOOP's algorithms and 
 
 ## Quick start
 
-Requires [Go](https://go.dev/doc/install) and Python 3.
+Requires [Go](https://go.dev/doc/install) and Python 3. `setup.sh` targets macOS + zsh; elsewhere, build with
+`go build -o ghealth .`, run `./ghealth setup`, then `python3 stats.py` directly.
 
 ```bash
 git clone https://github.com/yashmouje/google-health-cli.git
