@@ -46,8 +46,8 @@ def series(rows, date_key="date"):
 
 
 def daily_rollup_chunked(data_type, start, end, chunk_days=14):
-    """Some rollup endpoints (e.g. heart-rate) cap the range per request.
-    Pull in <=chunk_days windows and merge."""
+    """Rollup endpoints cap the range per request (heart-rate: 14d, steps and
+    active-zone-minutes: 90d). Pull in <=chunk_days windows and merge."""
     rows = []
     cursor = start
     while cursor <= end:
@@ -132,7 +132,7 @@ def clamp(v, lo, hi):
 def collect(start, end):
     metrics = {}
 
-    rows = series(ghealth_json("data", "steps", "daily-rollup", "--from", str(start), "--to", str(end)))
+    rows = series(daily_rollup_chunked("steps", start, end, chunk_days=90))
     metrics["steps"] = {
         "label": "Steps", "unit": "", "icon": "🏃",
         "dates": [r["date"] for r in rows if "countSum" in r],
@@ -153,7 +153,7 @@ def collect(start, end):
         "values": [r["beatsPerMinuteAvg"] for r in rows if "beatsPerMinuteAvg" in r],
     }
 
-    rows = series(ghealth_json("data", "active-zone-minutes", "daily-rollup", "--from", str(start), "--to", str(end)))
+    rows = series(daily_rollup_chunked("active-zone-minutes", start, end, chunk_days=90))
     dates, values = [], []
     for r in rows:
         if "date" not in r:

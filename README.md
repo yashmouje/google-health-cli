@@ -1,6 +1,54 @@
-# ghealth
+# google-health-cli + Fitbit stats
 
-CLI for the [Google Health API v4](https://developers.google.com/health) — built for AI agents and developers.
+Your Fitbit data in the terminal: graphs, trends, and WHOOP-style Recovery / Strain / Sleep scores.
+
+> **Based on [Google-Health-API/google-health-cli](https://github.com/Google-Health-API/google-health-cli)**
+> (Apache 2.0). The `ghealth` Go CLI is Google's. This repo adds `stats.py`, `setup.sh`, and
+> `keepalive.sh` on top. The Go code is unchanged.
+
+## What's added
+
+| File | What it does |
+|------|--------------|
+| `stats.py` | Pulls steps, sleep, heart rate, Active Zone Minutes, HRV, and SpO2 through `ghealth` and prints stats and terminal graphs |
+| `setup.sh` | One-shot setup: builds `ghealth`, installs Python deps, walks through Google Cloud OAuth, adds a `fitbit` shell command, and installs the keepalive cron job |
+| `keepalive.sh` | Daily cron job that refreshes the OAuth token and logs a warning to `keepalive.log` if auth breaks |
+
+`stats.py` modes:
+
+```bash
+fitbit                 # last 14 days: stats, graphs, Recovery / Strain / Sleep Performance, Fitness Age
+fitbit --days 60       # longer window
+fitbit --trend         # trend analysis: weekly drift, first-vs-second-half significance, correlations, consistency
+```
+
+The scores are rough approximations for fun. They aren't WHOOP's algorithms and aren't medical advice.
+
+## Quick start
+
+Requires [Go](https://go.dev/doc/install) and Python 3.
+
+```bash
+git clone https://github.com/yashmouje/google-health-cli.git
+cd google-health-cli
+./setup.sh
+```
+
+`setup.sh` asks for your Google Cloud project ID and the OAuth `client_secret` JSON
+(Desktop app type, from the [Console](https://console.cloud.google.com/apis/credentials)).
+Credentials are stored under `~/.config/ghealth/` and never in the repo.
+
+**Token expiry:** while your OAuth app is in *Testing* mode, refresh tokens expire after 7 days and
+you'll need to run `./ghealth auth login` again. Publishing the app in the GCP Console stops that.
+`keepalive.sh` only warns you when it happens.
+
+---
+
+# `ghealth` CLI reference (upstream)
+
+The rest of this README is Google's documentation for the `ghealth` CLI.
+
+CLI for the [Google Health API v4](https://developers.google.com/health), built for AI agents and developers.
 
 - **40 verified data types**: steps, heart rate, exercise, sleep, weight, SpO2, HRV, ECG, blood glucose, nutrition, and more
 - **Agent-first**: simplified JSON output, deterministic exit codes, `--dry-run`, `--raw`
@@ -15,15 +63,9 @@ ghealth data heart-rate list --from today --limit 10       # Recent heart rate r
 ghealth schema types                                       # See all available data types
 ```
 
-## Requirements
-
-Download and Install [Go](https://go.dev/doc/install)
-
 ## Installation
 
 ```bash
-git clone https://github.com/Google-Health-API/google-health-cli.git
-cd google-health-cli
 go build -o ghealth .
 ```
 
